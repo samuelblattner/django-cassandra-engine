@@ -8,6 +8,7 @@ from functools import partial
 from itertools import chain
 
 import six
+from cassandra.cqlengine.columns import Column
 from django.conf import settings
 from django.apps import apps
 from django.core import validators
@@ -182,8 +183,39 @@ class DjangoCassandraOptions(options.Options):
 class DjangoCassandraModelMetaClass(ModelMetaClass, ModelBase):
 
     def __new__(cls, name, bases, attrs):
-        parents = [b for b in bases if isinstance(b, DjangoCassandraModelMetaClass)]
 
+        if attrs.get('Meta', None) is not None and hasattr(attrs.get('Meta'), 'i18n_fields'):
+            for i18n_fieldname in attrs.get('Meta').i18n_fields:
+
+                base_column: Column = attrs.get(i18n_fieldname, None)
+
+                if base_column is None:
+                    for _klass in chain(*[base.__mro__ for base in bases]):
+                        if not hasattr(_klass, i18n_fieldname):
+                            continue
+                        base_column: Column = _klass._get_column(i18n_fieldname)
+                        print(base_column)
+                        if isinstance(base_column, Column):
+                            break
+
+                    else:
+                        raise RuntimeError('I18N field {} could not be found on class {} or any of'
+                                           'its ancestors.'.format(i18n_fieldname, name))
+
+                for lang, __ in settings.LANGUAGES:
+                    attrs['{}_{}'.format(i18n_fieldname, lang)] = base_column.__class__(
+                        primary_key=base_column.primary_key,
+                        partition_key=base_column.partition_key,
+                        index=base_column.index,
+                        db_field=base_column.db_field,
+                        default=base_column.default,
+                        required=base_column.required,
+                        clustering_order=base_column.clustering_order,
+                        discriminator_column=base_column.discriminator_column,
+                        static=base_column.static,
+                        custom_index=base_column.custom_index)
+
+        parents = [b for b in bases if isinstance(b, DjangoCassandraModelMetaClass)]
         if not parents:
             return super(ModelBase, cls).__new__(cls, name, bases, attrs)
         for attr in _django_manager_attr_names:
@@ -215,6 +247,7 @@ class DjangoCassandraModelMetaClass(ModelMetaClass, ModelBase):
 
         column_definitions = [(k, v) for k, v in attrs.items() if
                               isinstance(v, columns.Column)]
+
         column_definitions = sorted(column_definitions,
                                     key=lambda x: x[1].position)
 
@@ -339,17 +372,32 @@ class DjangoCassandraModelMetaClass(ModelMetaClass, ModelBase):
             if not is_abstract:
                 raise ModelException(
                     "at least one partition key must be defined")
-        if len(partition_keys) == 1:
-            pk_name = [x for x in partition_keys.keys()][0]
-            attrs['pk'] = attrs[pk_name]
+
+        # To define pk filed, take Meta.get_pk_field attribute into account
+        # 1. Look at the current class's Meta
+        # 2. If it doesn't have the attribute, try to find it in all ancestors of the class
+        # 3. If the attribute can't be found anywhere, fallback to the default behaviour
+        get_pk_field = getattr(attrs.get('Meta', None), 'get_pk_field', None)
+        if get_pk_field is not None:
+            attrs['pk'] = attrs[get_pk_field]
         else:
-            # composite partition key case, get/set a tuple of values
-            _get = lambda self: tuple(
-                self._values[c].getval() for c in partition_keys.keys())
-            _set = lambda self, val: tuple(
-                self._values[c].setval(v) for (c, v) in
-                zip(partition_keys.keys(), val))
-            attrs['pk'] = property(_get, _set)
+            for parent in chain(*[base.__mro__ for base in bases]):
+                get_pk_field = getattr(getattr(parent, 'Meta', None), 'get_pk_field', None)
+                if get_pk_field is not None:
+                    attrs['pk'] = getattr(parent, get_pk_field)
+                    break
+            else:
+                if len(partition_keys) == 1:
+                    pk_name = [x for x in partition_keys.keys()][0]
+                    attrs['pk'] = attrs[pk_name]
+                elif len(partition_keys) > 1:
+                    # composite partition key case, get/set a tuple of values
+                    _get = lambda self: tuple(
+                        self._values[c].getval() for c in partition_keys.keys())
+                    _set = lambda self, val: tuple(
+                        self._values[c].setval(v) for (c, v) in
+                        zip(partition_keys.keys(), val))
+                    attrs['pk'] = property(_get, _set)
 
         # some validation
         col_names = set()
@@ -453,7 +501,7 @@ class DjangoCassandraModelMetaClass(ModelMetaClass, ModelBase):
         django_meta_default_names = options.DEFAULT_NAMES
 
         # patch django so Meta.get_pk_field can be specified these models
-        options.DEFAULT_NAMES = django_meta_default_names + ('get_pk_field',)
+        options.DEFAULT_NAMES = django_meta_default_names + ('get_pk_field', 'i18n_fields')
 
         # We should call the contribute_to_class method only if it's bound
         if not inspect.isclass(value) and hasattr(value, 'contribute_to_class'):
@@ -731,6 +779,9 @@ class DjangoCassandraQuerySet(query.ModelQuerySet):
         obj.pk = getattr(obj, obj._get_explicit_pk_column().name)
         return obj
 
+    def last(self):
+        return None if self.count() == 0 else self[-1]
+
     def order_by(self, *colnames):
         if len(colnames) == 0:
             clone = copy.deepcopy(self)
@@ -846,6 +897,7 @@ class DjangoCassandraModel(
             if len(cls._primary_keys) > 1:
                 try:
                     pk_field = cls.Meta.get_pk_field
+
                 except AttributeError:
                     raise RuntimeError(PK_META_MISSING_HELP.format(cls))
                 return cls._primary_keys[pk_field]
@@ -853,3 +905,6 @@ class DjangoCassandraModel(
                 return list(six.itervalues(cls._primary_keys))[0]
         except IndexError:
             return None
+
+    def clean_fields(self):
+        pass
